@@ -1,0 +1,26 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+publish/
+
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+
+# Playwright
+tests/playwright-report/
+tests/test-results/
+tests/node_modules/
+
+# Environment
+.env
+.env.local
+*.env
+
+# OS
+.DS_Store
+Thumbs.db

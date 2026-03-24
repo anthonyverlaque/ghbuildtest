@@ -1,0 +1,215 @@
+name: CI — Build, Test & Publish
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  NODE_VERSION: '24.x'
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# All jobs run on your self-hosted Linux runner.
+# Tag your runner with the label "self-hosted-linux" in GitHub Settings →
+# Actions → Runners, or change the runs-on value to match your runner labels.
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+
+  # ── 1. Build & lint the .NET API ──────────────────────────────────────────
+  build-api:
+    name: Build .NET API
+    runs-on: [self-hosted, linux]
+    defaults:
+      run:
+        working-directory: api
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore NuGet packages
+        run: dotnet restore
+
+      - name: Build (Release)
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Publish API artifact
+        run: |
+          dotnet publish --configuration Release --no-build \
+            --output ${{ github.workspace }}/publish/api
+
+      - name: Upload API artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-publish
+          path: ${{ github.workspace }}/publish/api
+          retention-days: 7
+
+  # ── 2. Build & lint the Vue frontend ─────────────────────────────────────
+  build-frontend:
+    name: Build Vue Frontend
+    runs-on: [self-hosted, linux]
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Build for production
+        run: npm run build
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 7
+
+  # ── 3. Playwright E2E tests ───────────────────────────────────────────────
+  e2e-tests:
+    name: Playwright E2E Tests
+    runs-on: [self-hosted, linux]
+    needs: [build-api, build-frontend]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Setup runtimes ──
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: tests/package-lock.json
+
+      # ── Download build artifacts ──
+      - name: Download API artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: api-publish
+          path: publish/api
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      # ── Install frontend preview server deps ──
+      - name: Install frontend deps (for vite preview)
+        working-directory: frontend
+        run: npm ci
+
+      # ── Install & configure Playwright ──
+      - name: Install Playwright test deps
+        working-directory: tests
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: tests
+        run: npx playwright install --with-deps chromium firefox
+
+      # ── Start API in background ──
+      - name: Start .NET API
+        run: |
+          dotnet publish/api/Api.dll --urls "http://localhost:5000" &
+          echo "API_PID=$!" >> $GITHUB_ENV
+          # Wait for API to be ready
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:5000/health && break
+            echo "Waiting for API... ($i/30)"
+            sleep 2
+          done
+
+      # ── Start Vue preview in background ──
+      - name: Start Vue preview server
+        working-directory: frontend
+        run: |
+          npm run preview -- --port 5173 &
+          echo "FRONTEND_PID=$!" >> $GITHUB_ENV
+          # Wait for frontend
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:5173 && break
+            echo "Waiting for frontend... ($i/20)"
+            sleep 2
+          done
+
+      # ── Run Playwright ──
+      - name: Run Playwright tests
+        working-directory: tests
+        run: npx playwright test
+        env:
+          CI: true
+
+      # ── Cleanup ──
+      - name: Stop background servers
+        if: always()
+        run: |
+          kill $API_PID $FRONTEND_PID 2>/dev/null || true
+
+      # ── Upload results ──
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: tests/playwright-report
+          retention-days: 14
+
+      - name: Upload Playwright screenshots (failures only)
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-screenshots
+          path: tests/test-results
+          retention-days: 7
+
+  # ── 4. Summary job — gates merges ─────────────────────────────────────────
+  ci-success:
+    name: CI Passed
+    runs-on: [self-hosted, linux]
+    needs: [build-api, build-frontend, e2e-tests]
+    if: always()
+
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.build-api.result }}" != "success" || \
+                "${{ needs.build-frontend.result }}" != "success" || \
+                "${{ needs.e2e-tests.result }}" != "success" ]]; then
+            echo "One or more jobs failed."
+            exit 1
+          fi
+          echo "All CI jobs passed ✓"
